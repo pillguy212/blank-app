@@ -1,4 +1,6 @@
 streamlit
 pandas
+numpy
 requests
 openpyxl
+matplotlib
