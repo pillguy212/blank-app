@@ -8,124 +8,110 @@ from io import BytesIO
 st.set_page_config(page_title="BTC minute data downloader", layout="wide")
 
 st.title("BTC - données minute par minute (7 derniers jours)")
-st.write("Télécharge les données BTCUSDT à chaque minute et exporte en Excel.")
+st.write("Récupération depuis Coinbase Exchange API, puis export Excel ou CSV.")
 
-BASE_URL = "https://api.binance.com/api/v3/klines"
+BASE_URL = "https://api.exchange.coinbase.com/products/{}/candles"
 
 
-def fetch_binance_klines(symbol: str, interval: str, start_ms: int, end_ms: int):
+def fetch_coinbase_candles(product_id: str, start_dt: datetime, end_dt: datetime, granularity: int = 60):
     """
-    Récupère toutes les bougies Binance entre start_ms et end_ms.
-    Binance limite le nombre de klines par appel, donc on boucle.
+    Coinbase retourne les chandelles OHLC.
+    On découpe la période en blocs pour récupérer les 7 jours minute par minute.
     """
     all_rows = []
-    current_start = start_ms
-    limit = 1000  # Binance supporte startTime, endTime et limit sur klines
+
+    total_minutes = int((end_dt - start_dt).total_seconds() // 60)
+    if total_minutes <= 0:
+        return []
+
+    # 300 bougies par appel = très stable pour éviter les problèmes
+    chunk_size_minutes = 300
 
     progress = st.progress(0)
     status = st.empty()
 
-    estimated_total_minutes = max(1, int((end_ms - start_ms) / 60000))
-    fetched_minutes = 0
+    current_start = start_dt
+    fetched = 0
 
-    while current_start < end_ms:
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    while current_start < end_dt:
+        current_end = min(current_start + timedelta(minutes=chunk_size_minutes), end_dt)
+
         params = {
-            "symbol": symbol,
-            "interval": interval,
-            "startTime": current_start,
-            "endTime": end_ms,
-            "limit": limit,
+            "start": current_start.isoformat(),
+            "end": current_end.isoformat(),
+            "granularity": granularity
         }
 
-        r = requests.get(BASE_URL, params=params, timeout=20)
+        url = BASE_URL.format(product_id)
+
+        r = requests.get(url, params=params, headers=headers, timeout=20)
         r.raise_for_status()
+
         data = r.json()
 
-        if not data:
-            break
+        if isinstance(data, list) and data:
+            all_rows.extend(data)
 
-        all_rows.extend(data)
+        fetched += int((current_end - current_start).total_seconds() // 60)
+        progress.progress(min(fetched / total_minutes, 1.0))
+        status.text(f"Récupération en cours... {fetched} / {total_minutes} minutes")
 
-        last_open_time = data[-1][0]
-        next_start = last_open_time + 60_000  # +1 minute
-
-        newly_fetched = len(data)
-        fetched_minutes += newly_fetched
-
-        progress_ratio = min(fetched_minutes / estimated_total_minutes, 1.0)
-        progress.progress(progress_ratio)
-        status.text(f"Récupération en cours... {fetched_minutes} lignes")
-
-        if next_start <= current_start:
-            break
-
-        current_start = next_start
-        time.sleep(0.15)  # petite pause pour être poli avec l'API
+        current_start = current_end
+        time.sleep(0.15)
 
     progress.progress(1.0)
-    status.text(f"Terminé. {len(all_rows)} lignes récupérées.")
+    status.text("Téléchargement terminé.")
+
     return all_rows
 
 
-def klines_to_dataframe(rows):
-    columns = [
-        "open_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "close_time",
-        "quote_asset_volume",
-        "number_of_trades",
-        "taker_buy_base_asset_volume",
-        "taker_buy_quote_asset_volume",
-        "ignore",
-    ]
+def candles_to_dataframe(rows):
+    """
+    Format Coinbase:
+    [time, low, high, open, close, volume]
+    """
+    if not rows:
+        return pd.DataFrame()
 
-    df = pd.DataFrame(rows, columns=columns)
+    df = pd.DataFrame(rows, columns=["timestamp", "low", "high", "open", "close", "volume"])
 
-    numeric_cols = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "quote_asset_volume",
-        "taker_buy_base_asset_volume",
-        "taker_buy_quote_asset_volume",
-    ]
-
-    for col in numeric_cols:
+    # Types numériques
+    for col in ["low", "high", "open", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df["number_of_trades"] = pd.to_numeric(df["number_of_trades"], errors="coerce")
+    # Timestamp
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
 
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    # Retirer doublons, trier
+    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
-    # Colonnes pratiques pour Excel / lecture humaine
-    df["date_utc"] = df["open_time"].dt.strftime("%Y-%m-%d")
-    df["time_utc"] = df["open_time"].dt.strftime("%H:%M:%S")
-    df["timestamp_utc"] = df["open_time"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    # Colonnes pratiques
+    df["timestamp_utc"] = df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    df["date_utc"] = df["timestamp"].dt.strftime("%Y-%m-%d")
+    df["time_utc"] = df["timestamp"].dt.strftime("%H:%M:%S")
 
-    # Réorganiser les colonnes
+    # Heure Québec
+    try:
+        df["timestamp_montreal"] = df["timestamp"].dt.tz_convert("America/Toronto").dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        df["timestamp_montreal"] = ""
+
     df = df[
         [
             "timestamp_utc",
+            "timestamp_montreal",
             "date_utc",
             "time_utc",
-            "open_time",
             "open",
             "high",
             "low",
             "close",
             "volume",
-            "number_of_trades",
-            "quote_asset_volume",
-            "taker_buy_base_asset_volume",
-            "taker_buy_quote_asset_volume",
-            "close_time",
+            "timestamp",
         ]
     ]
 
@@ -139,42 +125,37 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-col1, col2, col3 = st.columns(3)
+col1, col2 = st.columns(2)
 
 with col1:
-    symbol = st.text_input("Symbole Binance", value="BTCUSDT")
+    product_id = st.text_input("Produit Coinbase", value="BTC-USD")
 
 with col2:
     days = st.number_input("Nombre de jours", min_value=1, max_value=30, value=7, step=1)
 
-with col3:
-    interval = st.selectbox("Intervalle", options=["1m"], index=0)
-
 if st.button("Récupérer les données"):
     try:
-        end_dt = datetime.now(timezone.utc)
+        end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         start_dt = end_dt - timedelta(days=int(days))
 
-        start_ms = int(start_dt.timestamp() * 1000)
-        end_ms = int(end_dt.timestamp() * 1000)
-
         st.info(
-            f"Récupération de {symbol} de {start_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} "
-            f"à {end_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+            f"Récupération de {product_id} du "
+            f"{start_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} au "
+            f"{end_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}"
         )
 
-        rows = fetch_binance_klines(
-            symbol=symbol.strip().upper(),
-            interval=interval,
-            start_ms=start_ms,
-            end_ms=end_ms,
+        rows = fetch_coinbase_candles(
+            product_id=product_id.strip().upper(),
+            start_dt=start_dt,
+            end_dt=end_dt,
+            granularity=60
         )
 
-        if not rows:
+        df = candles_to_dataframe(rows)
+
+        if df.empty:
             st.warning("Aucune donnée récupérée.")
         else:
-            df = klines_to_dataframe(rows)
-
             st.success(f"{len(df)} lignes récupérées.")
             st.dataframe(df, use_container_width=True, height=500)
 
@@ -184,18 +165,18 @@ if st.button("Récupérer les données"):
             st.download_button(
                 label="Télécharger en Excel",
                 data=excel_bytes,
-                file_name=f"{symbol.upper()}_{days}days_1m.xlsx",
+                file_name=f"{product_id.replace('-', '_')}_{days}days_1m.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
             st.download_button(
                 label="Télécharger en CSV",
                 data=csv_bytes,
-                file_name=f"{symbol.upper()}_{days}days_1m.csv",
+                file_name=f"{product_id.replace('-', '_')}_{days}days_1m.csv",
                 mime="text/csv",
             )
 
     except requests.HTTPError as e:
-        st.error(f"Erreur API Binance : {e}")
+        st.error(f"Erreur API Coinbase : {e}")
     except Exception as e:
         st.error(f"Erreur : {e}")
